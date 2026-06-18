@@ -1,0 +1,31 @@
+schema_version = "1.0.0"
+
+id = "moldforge"
+name = "MoldForge"
+version = "0.23.2"
+
+tagline = "Generate printable silicone mold systems from a mesh"
+description = "Turns a 3D model into a printable mold: a silicone pour box (with optional glove-mold skin keys), a direct printed mold (hugging or block), or a one-part open tray for flat & relief objects like text, coins and medallions (embed for a silicone stamp or frame a real object, with a rectangular or material-saving hugging outline). The box/direct molds split vertically into 2-4 pieces and optionally horizontally with a bolted insert-ready flange ring. Auto-orients and contours the split with keys/teeth, adds clamp wings, shapeable pour funnels (straight tube to wide flare), air vents and a detachable keyed base plate, warns about undercuts, estimates volume & weight, and exports STL."
+website = "https://moldforge.plesuro.eu"
+
+maintainer = "Plesuro <moldforge@plesuro.eu>"
+type = "add-on"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Plesuro"]
+
+blender_version_min = "5.1.0"
+
+tags = ["Mesh", "Modeling", "Object"]
+
+[permissions]
+files = "Export the generated mold parts as STL files"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "tests/",
+  "site/",
+  "/.gitignore",
+]
