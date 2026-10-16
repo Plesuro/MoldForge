@@ -19,21 +19,22 @@ def _funnel_at(mold, master, pt, props):
 
     The cavity is carved AFTER the funnel is unioned on (see the pipeline), so the
     throat opens by construction — no auto-narrowing, no model-clearance juggling.
-    The throat (bottom) radius is exactly the user's Throat Radius, capped only by
-    the mold's size; the mouth is throat x Flare. The straight neck makes a clean
-    circular hole, and the flare starts above the cavity ceiling's high point so it
-    never cuts the shell off-round."""
+    The throat (bottom) radius is the user's Throat Radius, auto-capped to the
+    mold's size — unless Oversized Throat is on, which is FULLY MANUAL: exactly the
+    typed radius, no cap at all. Same for the mouth (throat x Flare) with Oversized
+    Mouth. The straight neck makes a clean circular hole, and the flare starts
+    above the cavity ceiling's high point so it never cuts the shell off-round."""
     mn, mx = util.world_bbox(mold)
     mold_half_min = max(min(mx.x - mn.x, mx.y - mn.y) * 0.5, 1e-4)
     big_throat = getattr(props, "big_throat", False)
-    throat_cap = (C.THROAT_CAP_BIG if big_throat else C.THROAT_CAP) * mold_half_min
-    sprue_r = min(props.sprue_radius, throat_cap)                # throat (bottom)
+    sprue_r = (props.sprue_radius if big_throat                  # manual: exact value
+               else min(props.sprue_radius, C.THROAT_CAP * mold_half_min))
     flare = max(getattr(props, "sprue_flare", 2.4), 1.0)        # 1.0 = straight tube
     big_mouth = getattr(props, "big_mouth", False)
     # Mouth auto-caps at MOUTH_CAP * half-width so it stays on the mold; Oversized
-    # Mouth lifts that (to a generous safety limit) and lets it overhang (UI warns).
-    mouth_cap = (C.MOUTH_CAP_BIG if big_mouth else C.MOUTH_CAP) * mold_half_min
-    mouth_r = min(sprue_r * flare, mouth_cap)
+    # Mouth is fully manual (throat x Flare exactly) and may overhang (UI warns).
+    mouth_r = (sprue_r * flare if big_mouth
+               else min(sprue_r * flare, C.MOUTH_CAP * mold_half_min))
     jacket = props.box_style == 'POUR_BOX'   # hollow shell (gap around model)
     gap = getattr(props, "silicone_gap", props.wall_thickness)
     wall = max(props.shell_wall if jacket else props.wall_thickness, 1.2)
@@ -112,14 +113,174 @@ def _funnel_at(mold, master, pt, props):
     }
 
 
+def _marker_funnel_at(mold, master, pt, props):
+    """Funnel geometry for a user Pour Marker. Unlike the auto funnels (anchored
+    to the model's local top under the column - a mid-height side marker would
+    leave the spout floating in air), the marker spout stands on the MOLD's own
+    outer surface straight above the marker, and the bore later runs from the
+    mouth ALL the way down to the marker itself. Returns None if the marker's
+    column misses the mold entirely (marker parked outside the footprint)."""
+    mn, mx = util.world_bbox(mold)
+    mold_half_min = max(min(mx.x - mn.x, mx.y - mn.y) * 0.5, 1e-4)
+    big_throat = getattr(props, "big_throat", False)
+    sprue_r = (props.sprue_radius if big_throat
+               else min(props.sprue_radius, C.THROAT_CAP * mold_half_min))
+    flare = max(getattr(props, "sprue_flare", 2.4), 1.0)
+    big_mouth = getattr(props, "big_mouth", False)
+    mouth_r = (sprue_r * flare if big_mouth
+               else min(sprue_r * flare, C.MOUTH_CAP * mold_half_min))
+    jacket = props.box_style == 'POUR_BOX'
+    gap = getattr(props, "silicone_gap", props.wall_thickness)
+    wall = max(props.shell_wall if jacket else props.wall_thickness, 1.2)
+    edge = min(pt.x - mn.x, mx.x - pt.x, pt.y - mn.y, mx.y - pt.y)
+    if not big_mouth:
+        mouth_r = min(mouth_r, edge - wall)
+    mouth_r = max(mouth_r, sprue_r)
+
+    inv = mold.matrix_world.inverted()
+    hit, loc, _n, _i = mold.ray_cast(
+        inv @ Vector((pt.x, pt.y, mx.z + 50.0)),
+        (inv.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized())
+    if not hit:
+        return None
+    mold_z = (mold.matrix_world @ loc).z
+    fh = max(getattr(props, "funnel_height", 12.0), 1.0)
+    common = {
+        "pt_z": pt.z, "clear": 0.0,
+        "sprue_r": sprue_r, "mouth_r": mouth_r, "wall": wall,
+        "breach": max(gap * 0.5, 1e-4),
+        "neck_out": sprue_r + wall, "mouth_out": mouth_r + wall,
+        "marker": True,
+    }
+    near_under = mold_z - pt.z <= gap + wall + 6.0
+    # "Near the top" must mean under the mold's actual TOP PLATEAU - not merely
+    # close under a low sloped shoulder (a bulge marker sits ~8 mm under the
+    # jacket shoulder, and a vertical spout built there gets cored into a ring
+    # by the cavity carve). Anything else takes the filler pipe.
+    at_plateau = mold_z >= mx.z - fh - 4.0
+    if near_under and at_plateau:
+        return {**common, "x": pt.x, "y": pt.y,
+                "base_z": mold_z - max(2.0, wall),
+                "apex_z": max(mold_z + fh, mold_z + fh * 0.35 + 1.0),
+                "throat_top": mold_z + fh * 0.35}
+    # Locking Base: the region below the plinth top is the SOCKET (it holds the
+    # printed base, not the cast) - a gate there would be a useless hole. Lift
+    # the gate to just above the plinth.
+    if (getattr(props, "base_style", '') == 'LOCK'
+            and props.box_style == 'POUR_BOX'):
+        lock_h = max(getattr(props, "lock_height", 10.0), 1.0)
+        pt = Vector((pt.x, pt.y, max(pt.z, mn.z + lock_h + 2.0)))
+
+    # Deep SIDE marker: an external FILLER PIPE. Deliberately the simplest
+    # possible geometry so it works on ANY shape: one straight, slim vertical
+    # tube standing just outside the widest point of the shell above the marker,
+    # a solid collar bridging pipe-to-wall at the marker (the gate bores through
+    # it), and a small cup mouth above the rim. No path following, no contour
+    # logic - nothing shape-dependent that can mis-route. Probing happens on the
+    # PRISTINE shell (before any spout is unioned), so the pipe can never anchor
+    # to another funnel.
+    bore_r = min(sprue_r, 3.5)
+    wall_t = max(wall, 1.6)
+    tube_out = bore_r + wall_t
+    cx, cy = (mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5
+    d = Vector((pt.x - cx, pt.y - cy, 0.0))
+    d = d.normalized() if d.length > 1e-4 else Vector((1.0, 0.0, 0.0))
+    span = (mx - mn).length + 10.0
+    R = 0.0
+    shell_top = None
+    wall_hits = []
+    steps = 16
+    for k in range(steps + 1):
+        z = pt.z + (mx.z - 0.5 - pt.z) * k / steps
+        o = Vector((cx, cy, 0.0)) + d * span
+        o.z = z
+        hh, ll, _nn, _ii = mold.ray_cast(inv @ o, (inv.to_3x3() @ -d).normalized())
+        if hh:
+            w = mold.matrix_world @ ll
+            rr = math.hypot(w.x - cx, w.y - cy)
+            R = max(R, rr)
+            shell_top = z
+            wall_hits.append((z, rr))
+    if R <= 0.0 or shell_top is None:
+        return None
+    ax = cx + d.x * (R + tube_out - 1.5)          # welded at the widest point
+    ay = cy + d.y * (R + tube_out - 1.5)
+    # Brace struts: where the shell narrows away from the straight pipe, tie the
+    # pipe back to the wall every ~30 mm so it is not a fragile cantilever - a
+    # short round bar sunk into the wall (no brace where the pipe already
+    # touches). The bore is drilled AFTER the unions, so the channel stays open
+    # straight through any brace.
+    braces = []
+    target = pt.z + 25.0
+    for (z, rr) in wall_hits:
+        if len(braces) >= 5:
+            break
+        if z < target or z > shell_top - 4.0:
+            continue
+        if (R - 1.5 - rr) > 2.0:                  # real standoff at this height
+            braces.append((Vector((ax, ay, z)),
+                           Vector((cx + d.x * (rr - 1.5),
+                                   cy + d.y * (rr - 1.5), z))))
+        target = z + 30.0
+    cav_top = util.world_bbox(master)[1].z + gap
+    throat = max(shell_top, cav_top) + 1.5
+    mouth_rr = min(mouth_r, bore_r * 2.5)
+    return {**common, "x": ax, "y": ay, "px": pt.x, "py": pt.y,
+            "base_z": pt.z - tube_out, "apex_z": throat + fh * 0.6,
+            "throat_top": throat, "runner": True,
+            "tube_out": tube_out, "bore_r": bore_r, "braces": braces,
+            "sprue_r": bore_r, "mouth_r": mouth_rr,
+            "neck_out": tube_out, "mouth_out": mouth_rr + wall_t}
+
+
 def add_funnel_spouts(mold, master, props, coll):
     """Phase 1: union the solid funnel spout(s) (narrow neck -> wide mouth) onto the
-    mold and return their geometry (a list) so the wings can run up them."""
-    if not props.sprue:
+    mold and return their geometry (a list) so the wings can run up them.
+
+    Geometry is computed for ALL spouts FIRST, against the pristine mold, and only
+    then unioned - so a runner's shell probes can never hit another spout. Pour
+    Markers are their own feature: they build even with the main funnel off."""
+    marks = list(getattr(props, "pour_marks", None) or [])
+    if not props.sprue and not marks:
         return []
+    pairs = _pour_points(mold, master, props)
+    if not props.sprue:
+        pairs = [(q, mk) for (q, mk) in pairs if mk]
     funnels = []
-    for pt in _pour_points(mold, master, props):
-        f = _funnel_at(mold, master, pt, props)
+    for pt, is_marker in pairs:
+        f = (_marker_funnel_at(mold, master, pt, props) if is_marker
+             else _funnel_at(mold, master, pt, props))
+        if f is not None:
+            funnels.append(f)
+    for f in funnels:
+        if f.get("runner"):
+            # Filler pipe: straight vertical tube + gate collar + cup. Simple on
+            # purpose - the same three solids on every model.
+            tube = util.add_tube("MF_funnel",
+                                 Vector((f["x"], f["y"], f["base_z"])),
+                                 Vector((f["x"], f["y"], f["throat_top"] + 0.3)),
+                                 f["tube_out"], coll)
+            util.boolean(mold, tube, 'UNION')
+            util.remove_object(tube)
+            collar = util.add_tube("MF_funnel",
+                                   Vector((f["px"], f["py"], f["pt_z"])),
+                                   Vector((f["x"], f["y"], f["pt_z"])),
+                                   f["tube_out"], coll)
+            util.boolean(mold, collar, 'UNION')
+            util.remove_object(collar)
+            brace_r = max(f["tube_out"] * 0.5, 2.2)
+            for (a_pt, w_pt) in f.get("braces", []):
+                br = util.add_tube("MF_funnel", a_pt, w_pt, brace_r, coll)
+                util.boolean(mold, br, 'UNION')
+                util.remove_object(br)
+            cup = util.add_cone(
+                "MF_funnel", Vector((f["x"], f["y"],
+                                     (f["throat_top"] + f["apex_z"]) * 0.5)),
+                f["tube_out"], f["mouth_out"], f["apex_z"] - f["throat_top"],
+                'Z', coll)
+            util.boolean(mold, cup, 'UNION')
+            util.remove_object(cup)
+            continue
         jacket = props.box_style == 'POUR_BOX'
         t_z = f.get("throat_top", f["base_z"]) if jacket else f["base_z"]
         t_z = min(max(t_z, f["base_z"] + 0.5), f["apex_z"] - 0.5)
@@ -142,7 +303,6 @@ def add_funnel_spouts(mold, master, props, coll):
             )
             util.boolean(mold, cup, 'UNION')
             util.remove_object(cup)
-        funnels.append(f)
     return funnels
 
 
@@ -168,10 +328,35 @@ def bore_funnels_and_vents(mold, master, props, funnels, coll):
         # ending a cutter exactly on the spout's own bottom plane is coplanar boolean
         # input that can leave a zero-thickness membrane sealing the throat. The
         # cutter only removes mold (the cavity model is separate), so it costs no clearance.
+        if funnel.get("runner"):
+            br = funnel["bore_r"]
+            vb = util.add_tube(
+                "MF_funnelbore",
+                Vector((funnel["x"], funnel["y"], funnel["pt_z"])),
+                Vector((funnel["x"], funnel["y"], funnel["apex_z"] + 0.5)),
+                br, coll)
+            util.boolean(mold, vb, 'DIFFERENCE')
+            util.remove_object(vb)
+            gate_in = Vector((funnel["px"], funnel["py"], funnel["pt_z"]))
+            gate_out = Vector((funnel["x"], funnel["y"], funnel["pt_z"]))
+            over = (gate_in - gate_out).normalized() * 1.0
+            hb = util.add_tube("MF_funnelbore", gate_out, gate_in + over,
+                               br, coll)
+            util.boolean(mold, hb, 'DIFFERENCE')
+            util.remove_object(hb)
+            continue
         bore_top = funnel["apex_z"] + 0.5
         bore_bottom = funnel["base_z"] - max(1.0, 0.3 * gap)
+        if funnel.get("marker"):
+            # A marker funnel must reach the MARKER, not just below its own
+            # base: run the channel down to the user's point and open into the
+            # gap right there (or breach the cavity on a direct mold).
+            drop_to = funnel["pt_z"] + (gap * 0.5 if props.box_style == 'POUR_BOX'
+                                        else -funnel["breach"])
+            bore_bottom = min(bore_bottom, drop_to)
         t_z = min(max(funnel["throat_top"], bore_bottom + 0.5), bore_top - 0.5)
-        bore_base = max(funnel["sprue_r"] * C.NECK_TAPER, 0.4)
+        bore_base = (funnel["sprue_r"] if funnel.get("marker")   # straight shaft
+                     else max(funnel["sprue_r"] * C.NECK_TAPER, 0.4))
         neck = util.add_cone(
             "MF_funnelbore", Vector((funnel["x"], funnel["y"],
                                      (bore_bottom + t_z + 0.2) * 0.5)),
@@ -186,28 +371,71 @@ def bore_funnels_and_vents(mold, master, props, funnels, coll):
         util.boolean(mold, bore, 'DIFFERENCE')
         util.remove_object(bore)
 
-    if props.vent_count <= 0:
-        return
-    verts = [master.matrix_world @ v.co for v in master.data.vertices]
-    if not verts:
-        return
-    verts.sort(key=lambda p: p.z, reverse=True)
-
     def clears_funnels(p):
         for f in funnels:
             if math.hypot(p.x - f["x"], p.y - f["y"]) <= f["mouth_out"] + vent_r + 2.0:
                 return False
         return True
 
-    chosen = []
-    for p in verts:
-        if not all((p - q).length > props.vent_spacing for q in chosen):
-            continue
-        if funnels and not clears_funnels(p):
-            continue
-        chosen.append(p)
-        if len(chosen) >= props.vent_count:
-            break
+    def off_seams(p):
+        """A vent bore grazing a parting plane leaves a paper-thin blade of
+        shell standing on the seam face - a fragile needle right where the
+        mold opens (the Locking Base bottom arch). Nudge the vent's XY so its
+        bore keeps a printable wall to every seam. Build space: seams pass
+        through the origin."""
+        margin = vent_r + 3.0
+        q = p.copy()
+        n_parts = max(int(getattr(props, "parts_count", 2)), 2)
+        if n_parts >= 3:
+            r = math.hypot(q.x, q.y)
+            if r <= 1e-6:
+                return q
+            step = 2.0 * math.pi / n_parts
+            a = math.atan2(q.y, q.x)
+            k = round(a / step)
+            d = a - k * step
+            if abs(d) * r < margin:            # lateral distance to the seam ray
+                s_ = 1.0 if d >= 0.0 else -1.0
+                r2 = max(r, margin * 1.4)      # too near the axis: step outward
+                a2 = k * step + s_ * min(margin / r2, step * 0.45)
+                q.x, q.y = r2 * math.cos(a2), r2 * math.sin(a2)
+            return q
+        axis = getattr(props, "split_axis", 'AUTO')
+        if axis not in ('X', 'Y'):
+            mn2, mx2 = util.world_bbox(master)
+            axis = 'X' if (mx2.x - mn2.x) >= (mx2.y - mn2.y) else 'Y'
+        i = 0 if axis == 'X' else 1
+        if abs(q[i]) < margin:
+            q[i] = margin if q[i] >= 0.0 else -margin
+        return q
+
+    if getattr(props, "vent_place", 'AUTO') == 'MARKERS':
+        # ONE vent per user marker, exactly where placed (only a marker whose
+        # channel would collide with a funnel bore is skipped). Vent Count is
+        # ignored - the markers ARE the list.
+        chosen = [off_seams(Vector(m))
+                  for m in (getattr(props, "vent_marks", None) or [])
+                  if not funnels or clears_funnels(Vector(m))]
+        if not chosen:
+            return
+    else:
+        if props.vent_count <= 0:
+            return
+        verts = [master.matrix_world @ v.co for v in master.data.vertices]
+        if not verts:
+            return
+        verts.sort(key=lambda p: p.z, reverse=True)
+
+        chosen = []
+        for p in verts:
+            p = off_seams(p)
+            if not all((p - q).length > props.vent_spacing for q in chosen):
+                continue
+            if funnels and not clears_funnels(p):
+                continue
+            chosen.append(p)
+            if len(chosen) >= props.vent_count:
+                break
     for i, p in enumerate(chosen):
         vent = _vertical_channel(f"MF_vent_{i}", p, top, vent_r, vent_drop, vent_r, vent_r, coll)
         util.boolean(mold, vent, 'DIFFERENCE')
@@ -235,17 +463,47 @@ def _pour_points(mold, master, props):
                                 getattr(props, "sprue_y", 0.0))
     else:   # 'TOP'
         primary = _top_center_point(master, verts)
-    points = [primary]
+    points = [(primary, False)]
+
+    marks = list(getattr(props, "pour_marks", None) or [])
+    if marks:
+        # Pour Markers: extra spouts at the user's markers, boring down to the
+        # marker ITSELF (its full 3D position, snapped to the nearest model
+        # surface) - not to the model's local top under that column. The FIRST
+        # spout keeps the Placement logic above; markers replace the auto
+        # extras entirely. A marker essentially ON an existing spout is skipped
+        # (coincident boolean input). Deliberately TINY: it must only catch true
+        # coincidence - a Throat-scaled keep-out silently swallowed markers
+        # placed anywhere near the primary column with an Oversized Throat set.
+        keep_out = 2.0
+        for m in marks:
+            sp = _marker_on_model(master, m)
+            if all(math.hypot(sp.x - q.x, sp.y - q.y) > keep_out
+                   for q, _mk in points):
+                points.append((sp, True))
+        return points
 
     n = max(1, getattr(props, "sprue_count", 1))
     if n > 1:
         spacing = (mx - mn).length * 0.22 + 1.0
         for v in verts:
-            if all((v - q).length > spacing for q in points):
-                points.append(v)
+            if all((v - q).length > spacing for q, _mk in points):
+                points.append((v, False))
             if len(points) >= n:
                 break
     return points
+
+
+def _marker_on_model(master, m):
+    """Snap a pour marker to the NEAREST model surface point - the user placed
+    it by eye on the spot they want the pour to reach, so its full 3D position
+    (including depth under an overhang) is the target."""
+    inv = master.matrix_world.inverted()
+    try:
+        ok, loc, _n, _i = master.closest_point_on_mesh(inv @ Vector(m))
+    except RuntimeError:
+        ok = False
+    return (master.matrix_world @ loc) if ok else Vector(m)
 
 
 def _center_point(master, mn, mx):

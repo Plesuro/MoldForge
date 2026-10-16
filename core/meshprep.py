@@ -1,9 +1,12 @@
 """Mesh preparation: heal, decimate, voxel remesh, and centering."""
 
+import math
+
 import bpy
 import bmesh
 from mathutils import Matrix
 
+from . import constants as C
 from . import util
 
 
@@ -42,6 +45,15 @@ def decimate(obj, ratio):
 
 
 def voxel_remesh(obj, voxel_size):
+    # Safety net: never voxel a mesh so finely relative to its bounding box that the
+    # grid explodes and exhausts memory. A degenerate input (e.g. a Solidify spike
+    # flung millions of units out) would otherwise OOM the whole process here. Legit
+    # fine molds (a few hundred voxels across) stay far under the cap.
+    mn, mx = util.world_bbox(obj)
+    longest = max(mx.x - mn.x, mx.y - mn.y, mx.z - mn.z, 1e-4)
+    if not math.isfinite(longest):
+        longest = 1e9
+    voxel_size = max(voxel_size, longest / C.REMESH_MAX_SPAN_VOXELS)
     mod = obj.modifiers.new("mf_remesh", 'REMESH')
     mod.mode = 'VOXEL'
     mod.voxel_size = voxel_size

@@ -9,14 +9,31 @@ import bpy
 from bpy.props import PointerProperty
 
 from .properties import MoldForgeProperties
-from .operators import MOLDFORGE_OT_generate, MOLDFORGE_OT_export
-from .panel import MOLDFORGE_PT_main
+from .operators import (
+    MOLDFORGE_OT_generate,
+    MOLDFORGE_OT_export,
+    MOLDFORGE_OT_explode,
+    MOLDFORGE_OT_add_vent_marker,
+    MOLDFORGE_OT_add_pour_marker,
+    MOLDFORGE_OT_regenerate,
+    MOLDFORGE_OT_toggle_master,
+)
+from .panel import PANEL_CLASSES
+from .saved_settings import SETTINGS_CLASSES
 
+# Panels register LAST and in their own declared order: a sub-panel listed before
+# its parent fails to register and takes the whole add-on down with it.
 _classes = (
     MoldForgeProperties,
     MOLDFORGE_OT_generate,
     MOLDFORGE_OT_export,
-    MOLDFORGE_PT_main,
+    MOLDFORGE_OT_explode,
+    MOLDFORGE_OT_add_vent_marker,
+    MOLDFORGE_OT_add_pour_marker,
+    MOLDFORGE_OT_regenerate,
+    MOLDFORGE_OT_toggle_master,
+    *SETTINGS_CLASSES,
+    *PANEL_CLASSES,
 )
 
 

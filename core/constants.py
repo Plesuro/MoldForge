@@ -8,10 +8,10 @@ wall offset) unless noted.
 """
 
 # --- Funnel size caps (fraction of the mold half-width) -------------------- #
+# The Oversized Throat/Mouth toggles bypass these entirely (fully manual — the
+# typed value is built exactly); the caps apply only with the toggles off.
 THROAT_CAP = 0.30          # max throat radius
-THROAT_CAP_BIG = 0.45      # ... with Oversized Throat on (UI warns)
 MOUTH_CAP = 0.45           # max mouth radius
-MOUTH_CAP_BIG = 1.5        # ... with Oversized Mouth on (may overhang; UI warns)
 VENT_CAP = 0.16            # max vent radius
 
 # --- Funnel neck shaping --------------------------------------------------- #
@@ -26,6 +26,9 @@ DIRECT_VOXEL_DIV = 200.0   # direct-mold cavity voxel = model characteristic siz
 DIRECT_VOXEL_MIN = 0.3
 DIRECT_VOXEL_MAX = 1.2
 JACKET_VOXEL_FACTOR = 0.4  # pour-box cleanup voxel = this * wall offset (coarse is fine)
+REMESH_MAX_SPAN_VOXELS = 4000  # hard cap: never remesh finer than longest_extent/this, so a
+                               # stray spike (a blown-up Solidify) can't allocate a runaway
+                               # grid and OOM. Legit fine molds stay well under this.
 
 # --- Clamp flange (wings) -------------------------------------------------- #
 WING_INNER = 0.35              # rind inner surface reaches this * offset into the body

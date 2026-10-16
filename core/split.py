@@ -6,15 +6,17 @@ cut produces anything invalid. Flat splits also get conical alignment keys.
 """
 
 import math
+import types
 
 import bpy
 import bmesh
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 from . import util
 
 
-def split_parts(mold, master, axis, props, coll, wall, radial_center=None):
+def split_parts(mold, master, axis, props, coll, wall, radial_center=None,
+                wing_bolt_zs=None, parting=None):
     """Split the mold body into the requested number of printable pieces.
 
     Two pieces use the contoured/planar parting (with keys/teeth/wings). Three or
@@ -24,10 +26,13 @@ def split_parts(mold, master, axis, props, coll, wall, radial_center=None):
 
     ``radial_center`` is the centre the radial clamp wings were built around; when
     given, the wedge cuts use it so every seam falls exactly on its wing (the wings
-    shift the mold's bounding box, so re-deriving the centre would miss them)."""
+    shift the mold's bounding box, so re-deriving the centre would miss them).
+    ``wing_bolt_zs`` is the bolt heights the 2-part wings drilled (None = no wings) —
+    the wing alignment keys are placed between them."""
     n = max(int(getattr(props, "parts_count", 2)), 2)
     if n <= 2:
-        half_a, half_b = split(mold, master, axis, props, coll, wall)
+        half_a, half_b = split(mold, master, axis, props, coll, wall,
+                               wing_bolt_zs=wing_bolt_zs, parting=parting)
         return [half_a, half_b]
     return _split_radial(mold, master, props, coll, wall, n, center=radial_center)
 
@@ -55,18 +60,25 @@ def _valid(obj):
     return util.part_is_valid(obj)[0]
 
 
-def split(mold, master, axis, props, coll, wall):
+def split(mold, master, axis, props, coll, wall, wing_bolt_zs=None, parting=None):
+    """``parting`` (from ``parting_surface``, built before the clamp wings) is the
+    contoured surface the wings were cut along: the halves are split on exactly
+    that surface, so each half keeps its half of every wing."""
     mn, mx = util.world_bbox(mold)
     ai = {'X': 0, 'Y': 1}[axis]
     # Parting plane position along the split axis (clamped so neither half vanishes).
     cap = (mx[ai] - mn[ai]) * 0.4
     off = max(min(getattr(props, "split_offset", 0.0), cap), -cap)
+    if parting is not None:
+        off = parting.off
 
     half_a = half_b = None
     contoured = getattr(props, "contoured", True) and not getattr(props, "block", False)
     if contoured:
         try:
-            ca, cb = _split_contoured(mold, master, axis, coll, off)
+            ca, cb = _split_contoured(mold, master, axis, coll, off,
+                                      cutter=None if parting is None else parting.cutter,
+                                      flat=_flat_for(props, off))
             util.remove_small_islands(ca)   # boolean slivers, not a reason to reject
             util.remove_small_islands(cb)
             if _valid(ca) and _valid(cb):
@@ -80,6 +92,8 @@ def split(mold, master, axis, props, coll, wall):
                 util.remove_object(o)
 
     contoured_used = half_a is not None
+    if parting is not None:
+        parting.used = contoured_used
     if not contoured_used:
         half_a, half_b = _split_planar(mold, axis, coll, off)
         util.remove_small_islands(half_a)
@@ -100,7 +114,19 @@ def split(mold, master, axis, props, coll, wall):
         else:
             _add_keys(half_a, half_b, props, axis, ai, mn, mx, wall, coll, off)
 
+    # Wing Alignment: raised keys on half_a's wing faces that seat into matching
+    # sockets in half_b (works for flat AND contoured partings — the parting is flat
+    # across the wings either way). ``wing_bolt_zs is None`` means no wings were
+    # built (off, or rolled back), so nothing to key onto.
+    if (getattr(props, "wings", False) and wing_bolt_zs is not None
+            and getattr(props, "wing_keys", 'NONE') != 'NONE'):
+        _add_wing_keys(half_a, half_b, props, axis, ai, mn, mx, coll, off,
+                       wing_bolt_zs,
+                       parting=parting if contoured_used else None)
+
     return half_a, half_b
+
+
 
 
 def _split_planar(mold, axis, coll, off=0.0):
@@ -126,11 +152,15 @@ def _split_planar(mold, axis, coll, off=0.0):
     return half_a, half_b
 
 
-def _split_contoured(mold, master, axis, coll, off=0.0):
+def _split_contoured(mold, master, axis, coll, off=0.0, cutter=None, flat=None):
     """Split with a parting surface that follows the master's mid-depth profile
-    (flat outside the silhouette). half_a = +axis side, half_b = -axis side."""
+    (carried outward past the silhouette). half_a = +axis side, half_b = -axis
+    side. ``cutter`` is a prebuilt cutter (``parting_surface``); a copy is used."""
     mn, mx = util.world_bbox(mold)
-    cutter = _contoured_cutter(master, axis, mn, mx, coll, off)
+    if cutter is not None:
+        cutter = util.duplicate_object(cutter, "MF_part", coll)
+    else:
+        cutter = _contoured_cutter(master, axis, mn, mx, coll, off, flat=flat)
     half_a = util.duplicate_object(mold, "MF_Mold_A", coll)
     util.boolean(half_a, cutter, 'DIFFERENCE')   # remove -axis solid -> keep +axis
     half_b = util.duplicate_object(mold, "MF_Mold_B", coll)
@@ -139,10 +169,136 @@ def _split_contoured(mold, master, axis, coll, off=0.0):
     return half_a, half_b
 
 
-def _contoured_cutter(master, axis, mn, mx, coll, off=0.0, res=48):
+def parting_surface(mold, master, axis, props, coll, pad=0.0):
+    """The contoured parting surface for a two-piece split, built ONCE before the
+    clamp wings so the wings, their bolt holes and keys, and the split itself all
+    use the same surface. Returns a namespace (``cutter``: the solid below the
+    surface, ``off``, ``ai``, ``h``) or None for a flat parting.
+
+    The wings used to be cut from a flat slab on the bounding-box centre plane
+    while the split followed the model's mid-depth, carried outward past the
+    silhouette. On a model that leans along the split axis the two are
+    centimetres apart: each height's wing landed entirely in one half, and the
+    other half had nothing to clamp against there - wings "disappearing in
+    places". ``pad`` widens the cutter so it still covers the wings."""
+    if not getattr(props, "contoured", True) or getattr(props, "block", False):
+        return None
+    if int(getattr(props, "parts_count", 2)) > 2:
+        return None
+    mn, mx = util.world_bbox(mold)
+    ai = {'X': 0, 'Y': 1}[axis]
+    cap = (mx[ai] - mn[ai]) * 0.4
+    off = max(min(getattr(props, "split_offset", 0.0), cap), -cap)
+    padv = Vector((pad, pad, pad))
+    padv[ai] = 0.0
+    try:
+        cutter = _contoured_cutter(master, axis, mn - padv, mx + padv, coll, off,
+                                   flat=_flat_for(props, off))
+    except Exception:
+        return None
+    cutter.name = "MF_parting"
+    h = next(i for i in range(3) if i != ai and i != 2)
+    return types.SimpleNamespace(cutter=cutter, off=off, ai=ai, h=h, axis=axis,
+                                 used=None)
+
+
+def parting_at(parting, hv, z):
+    """The surface's position along the split axis at horizontal coordinate
+    ``hv`` (along the seam) and height ``z``, or None outside it."""
+    cut = parting.cutter
+    mn, mx = util.world_bbox(cut)
+    o = Vector((0.0, 0.0, 0.0))
+    o[parting.h] = hv
+    o[2] = z
+    o[parting.ai] = mx[parting.ai] + 10.0
+    d = Vector((0.0, 0.0, 0.0))
+    d[parting.ai] = -1.0
+    hit, loc, _n, _i = cut.ray_cast(o, d)
+    return loc[parting.ai] if hit else None
+
+
+def wing_tip(obj, parting, center, z, sgn, reach, seam_flat, ai, h, bias=0.0,
+             h0=None):
+    """Where the clamp wing on side ``sgn`` (along the seam axis ``h``) ends at
+    height z: ``(h_tip, seam)`` - the outermost point of ``obj`` and the parting
+    surface's position there - found by alternating a ray in along the seam (at
+    the surface + ``bias`` along the split axis ``ai``) with a look-up of the
+    surface. ``parting`` None = a flat parting at ``seam_flat``. ``h0`` is where
+    along the seam to read the surface first (default: well out past the
+    mold); on a steep seam a first read far from the wing can aim the ray past
+    it. None if the ray misses."""
+    seam = seam_flat
+    if parting is not None:
+        s0 = parting_at(parting, center[h] + sgn * reach * 0.25 if h0 is None else h0, z)
+        seam = s0 if s0 is not None else seam_flat
+    tip = None
+    for _ in range(4):
+        o = center.copy(); o[ai] = seam + bias; o[2] = z; o[h] = center[h] + sgn * reach
+        d = Vector((0.0, 0.0, 0.0)); d[h] = -sgn
+        hit, loc, _n, _i = obj.ray_cast(o, d)
+        if not hit:
+            return None
+        tip = loc[h]
+        if parting is None:
+            break
+        s1 = parting_at(parting, tip - sgn * 1.0, z)
+        if s1 is None or abs(s1 - seam) < 0.05:
+            break
+        seam = s1
+    return tip, seam
+
+
+def seam_band(parting, thickness, z_lo, z_hi, coll):
+    """A slab ``thickness`` thick (along the split axis) centred on the parting
+    surface, between heights z_lo and z_hi: what a clamp wing is cut from."""
+    up = util.duplicate_object(parting.cutter, "MF_wband", coll)
+    lo = util.duplicate_object(parting.cutter, "MF_wbandlo", coll)
+    sh = Vector((0.0, 0.0, 0.0))
+    sh[parting.ai] = thickness * 0.5
+    up.data.transform(Matrix.Translation(sh))
+    lo.data.transform(Matrix.Translation(-sh))
+    util.boolean(up, lo, 'DIFFERENCE')
+    util.remove_object(lo)
+    mn, mx = util.world_bbox(up)
+    big = (mx - mn).length * 2.0 + 10.0
+    box = util.add_box("MF_wbandz", Vector(((mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5,
+                                            (z_lo + z_hi) * 0.5)),
+                       Vector((big, big, z_hi - z_lo)), coll)
+    util.boolean(up, box, 'INTERSECT')
+    util.remove_object(box)
+    return up
+
+
+def flat_zone(mold, axis, z_lo, z_hi, z_top):
+    """Locking Base: the seam must stay a flat plane through the sawtooth plinth
+    and its socket, up to the socket's shoulder at ``z_top``, so each half's
+    share of the socket pulls straight off the plinth's teeth. Returns
+    ``(z_top, at)``: where along the split axis the plane sits - the middle of
+    the base across the plinth's own heights ``z_lo``..``z_hi`` (above them a
+    curved model's body already leans off to one side) - or None."""
+    ai = {'X': 0, 'Y': 1}[axis]
+    mw = mold.matrix_world
+    vals = [p[ai] for p in (mw @ v.co for v in mold.data.vertices)
+            if z_lo - 1e-3 <= p.z <= z_hi + 1e-3]
+    if not vals:
+        return None
+    return z_top, (min(vals) + max(vals)) * 0.5
+
+
+def _flat_for(props, off):
+    """The flat zone for the cutter (``(z_top, at, blend)``), or None."""
+    fz = getattr(props, "parting_flat", None)
+    if not fz:
+        return None
+    return fz[0], fz[1] + off, max(getattr(props, "parting_blend", 12.0), 1.0)
+
+
+def _contoured_cutter(master, axis, mn, mx, coll, off=0.0, res=48, flat=None):
     """A closed solid bounded above (in +axis) by the master's mid-depth surface
     and extending far into -axis. Subtracting it keeps the +axis half. ``off`` slides
-    the whole parting surface along the split axis."""
+    the whole parting surface along the split axis. ``flat`` = ``(z_top, at,
+    blend)``: the surface is the flat plane ``at`` up to ``z_top`` and blends
+    into the contoured one over ``blend`` above it (a Locking Base's plinth)."""
     ai = {'X': 0, 'Y': 1}[axis]
     u, v = [i for i in range(3) if i != ai]
     size = mx - mn
@@ -163,12 +319,42 @@ def _contoured_cutter(master, axis, mn, mx, coll, off=0.0, res=48):
         hit2, loc2, _n2, _i2 = master.ray_cast(o2, d2)
         if hit1 and hit2:
             return (loc1[ai] + loc2[ai]) * 0.5 + off
-        return cen   # outside the silhouette -> flat
+        return None      # outside the silhouette
 
     n = res + 1
     coords = [[(umin + (umax - umin) * i / res, vmin + (vmax - vmin) * j / res)
                for j in range(n)] for i in range(n)]
     H = [[mid_height(*coords[i][j]) for j in range(n)] for i in range(n)]
+
+    # Outside the silhouette - below the base, beyond the sides, above the top -
+    # the rays miss. Snapping those cells to the bbox centre put a STEP in the
+    # parting surface wherever the model's mid-depth is not that centre: on a
+    # leaning or curved sculpt that is a multi-millimetre ledge along the seam
+    # at the base plane (the user's "uncut line at the bottom of the shell") and
+    # along the silhouette edge, and it cut the funnel column off-centre.
+    # Extend the nearest in-model value outward instead, so the surface is
+    # continuous everywhere and only a model with no silhouette at all is flat.
+    if not any(h is not None for row in H for h in row):
+        H = [[cen] * n for _ in range(n)]
+    else:
+        for _ in range(2 * n):
+            todo = [(i, j) for i in range(n) for j in range(n) if H[i][j] is None]
+            if not todo:
+                break
+            grown = {}
+            for i, j in todo:
+                vals = [H[a][b] for a, b in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1))
+                        if 0 <= a < n and 0 <= b < n and H[a][b] is not None]
+                if vals:
+                    grown[(i, j)] = sum(vals) / len(vals)
+            if not grown:
+                break
+            for (i, j), val in grown.items():
+                H[i][j] = val
+        for i in range(n):
+            for j in range(n):
+                if H[i][j] is None:
+                    H[i][j] = cen
 
     # Smooth the height field so the parting is a clean wave, not a staircase.
     for _ in range(8):
@@ -178,6 +364,21 @@ def _contoured_cutter(master, axis, mn, mx, coll, off=0.0, res=48):
                 S[i][j] = (H[i][j] + H[i - 1][j] + H[i + 1][j]
                            + H[i][j - 1] + H[i][j + 1]) / 5.0
         H = S
+
+    if flat is not None:
+        # Flat through the plinth: every grid row up to the first one above
+        # z_top is exactly ``at`` (so the faces between them are flat too),
+        # then a smoothstep into the contoured surface.
+        z_top, at, blend = flat
+        dzg = (vmax - vmin) / res
+        for i in range(n):
+            for j in range(n):
+                t = (coords[i][j][1] - (z_top + dzg)) / blend
+                if t <= 0.0:
+                    H[i][j] = at
+                elif t < 1.0:
+                    s3 = t * t * (3.0 - 2.0 * t)
+                    H[i][j] = at + (H[i][j] - at) * s3
 
     bm = bmesh.new()
     top = {}
@@ -287,33 +488,187 @@ def _add_keys(half_a, half_b, props, axis, ai, mn, mx, wall, coll, off=0.0):
         placed += 1
 
 
+def _add_wing_keys(half_a, half_b, props, axis, ai, mn, mx, coll, off, bolt_zs,
+                   parting=None):
+    """Wing Alignment keys: a raised key on half_a's clamp-wing mating face seats into
+    a matching socket in half_b, so the bolted halves can't shear sideways. Three
+    shapes (the Wing Alignment option): CONE — a pointed pin, self-centering; DOME — a
+    half sphere, smooth engage/release; FRUSTUM — a half (truncated) cone pad, sturdy.
+
+    Each half keeps half the wing's thickness at the seam, so a key never protrudes
+    deeper than that lip minus the fit clearance minus a socket floor — a socket can
+    never punch through the mating wing. The key DIAMETER is the user's Key Size (a
+    bigger size grows the footprint; the dome becomes a wide spherical cap when the
+    lip is shallow). Keys are spread along the seam at the Key Spacing pitch, dodging
+    the drilled bolt holes (``bolt_zs``); the socket is the same shape grown by the
+    Fit Clearance so printed parts actually seat. Best-effort with rollback: a key
+    that would leave either half invalid is skipped, never breaking a good mold."""
+    style = getattr(props, "wing_keys", 'NONE')
+    h = next(i for i in range(3) if i != ai and i != 2)
+    center = (mn + mx) * 0.5
+    seam = center[ai] + off
+    width = max(getattr(props, "wing_width", 8.0), 2.0)
+    thickness = max(getattr(props, "wing_thickness", 4.0), 2.0)
+    clear = max(getattr(props, "fit_clearance", 0.2), 0.0)
+    prot_cap = thickness * 0.5 - clear - 0.5  # leave a floor under the socket
+    if prot_cap < 0.4:
+        return                                # wing lip too thin for a useful key
+    R = max(min(getattr(props, "wing_key_size", 6.0) * 0.5, width * 0.45), 0.5)
+    spacing = max(getattr(props, "wing_key_spacing", 40.0), 4.0)
+    height = max(getattr(props, "wing_key_height", 0.0), 0.0)
+    if height > 0.0:
+        # Explicit Key Height: the user chose how far the keys stand out — past the
+        # wing lip the socket punches through the mating wing as a hole (documented;
+        # still aligns). A Half Sphere is capped at a full hemisphere: any taller
+        # would bulge wider than its socket mouth and could never assemble.
+        prot = min(height, R) if style == 'DOME' else height
+    else:
+        # Auto: proportional to the key size, capped by the lip so the socket
+        # never pierces the wing.
+        want = {'CONE': R * 1.2, 'DOME': R, 'FRUSTUM': R * 0.7}.get(style, R)
+        prot = min(want, prot_cap)
+    embed = min(thickness * 0.25, 1.0)        # root sunk into A's lip for a solid weld
+    reach = (mx - mn).length + 10.0
+
+    # Key heights: evenly at the Key Spacing pitch, nudged off (or dropped from) any
+    # bolt hole.
+    zpad = max(R + 1.0, 2.0)
+    z0, z1 = mn.z + zpad, mx.z - zpad
+    if z1 <= z0:
+        return
+    span = z1 - z0
+    n = max(1, int(round(span / spacing)))
+    guard = max(getattr(props, "bolt_radius", 1.5), 0.5) + R + 1.0
+    picks = []
+    for k in range(n):
+        z = z0 + span * (k + 0.5) / n
+        zb = min(bolt_zs, key=lambda b: abs(b - z), default=None) if bolt_zs else None
+        if zb is not None and abs(zb - z) < guard:
+            for alt in (zb + guard, zb - guard):
+                if z0 <= alt <= z1 and all(abs(alt - b) >= guard for b in bolt_zs):
+                    z = alt
+                    break
+            else:
+                continue                       # no safe spot near this bolt: skip it
+        if all(abs(z - pz) >= 2.0 * R + 1.0 for pz in picks):
+            picks.append(z)
+
+    def shape(name, hc, z, grow, deeper, seam=seam):
+        c = center.copy(); c[h] = hc; c[2] = z
+        r_face = R + grow
+        depth_out = prot + deeper
+        if style == 'DOME':
+            # Spherical cap: footprint r_face on the seam, poking depth_out past it —
+            # a full hemisphere when the lip allows, a wider shallow cap when not. The
+            # sphere's buried bulk is clipped flush inside A's lip so the male can never
+            # bulge out of the wing's back face (and the socket cuts only its cap depth).
+            rs = (r_face * r_face + depth_out * depth_out) / (2.0 * depth_out)
+            c[ai] = seam + (rs - depth_out)
+            ball = util.add_sphere(name, c, rs, coll, subdiv=3)
+            sb = center.copy(); sb[ai] = seam + (embed - depth_out - 1.0) * 0.5
+            size = Vector((0.0, 0.0, 0.0))
+            size[ai] = depth_out + 1.0 + embed
+            size[h] = size[2] = 4.0 * rs + 4.0
+            sb[2] = z; sb[h] = hc
+            box = util.add_box(name + "_clip", sb, size, coll)
+            util.boolean(ball, box, 'INTERSECT')
+            util.remove_object(box)
+            return ball
+        r_tip = r_face * (0.06 if style == 'CONE' else 0.55)
+        # half_a keeps the +axis side, so the key protrudes toward -axis: tip at r1.
+        c[ai] = seam + (embed - depth_out) * 0.5
+        return util.add_cone(name, c, r_tip, r_face, depth_out + embed, axis, coll)
+
+    placed = 0
+    for h_sign in (1.0, -1.0):
+        for z in picks:
+            # probe inside A's wing lip, on the parting surface (contoured or flat)
+            found = wing_tip(half_a, parting, center, z, h_sign, reach, seam, ai, h,
+                             bias=min(thickness * 0.25, 0.8))
+            if found is None:
+                continue
+            tip, seam_here = found
+            hc = tip - h_sign * max(width * 0.45, R + 1.2)
+            if parting is not None:
+                s_key = parting_at(parting, hc, z)
+                seam_here = s_key if s_key is not None else seam_here
+
+            male = shape(f"MF_wkey_{placed}", hc, z, 0.0, 0.0, seam_here)
+            probe = util.duplicate_object(male, "MF_wktest", coll)
+            util.boolean(probe, half_a, 'INTERSECT')
+            seated = bool(probe.data.polygons)
+            util.remove_object(probe)
+            if not seated:
+                util.remove_object(male)
+                continue
+
+            socket = shape(f"MF_wsock_{placed}", hc, z, clear, clear, seam_here)
+            a_bak, b_bak = half_a.data.copy(), half_b.data.copy()
+            try:
+                util.boolean(half_a, male, 'UNION')
+                util.boolean(half_b, socket, 'DIFFERENCE')
+                if not (util.part_is_valid(half_a)[0] and util.part_is_valid(half_b)[0]):
+                    raise RuntimeError("wing key would break a half")
+                for bak in (a_bak, b_bak):
+                    if bak.users == 0:
+                        bpy.data.meshes.remove(bak)
+                placed += 1
+            except Exception:                 # roll back; a key never breaks a half
+                for obj, bak in ((half_a, a_bak), (half_b, b_bak)):
+                    cur = obj.data
+                    obj.data = bak
+                    if cur.users == 0:
+                        bpy.data.meshes.remove(cur)
+            finally:
+                util.remove_object(male)
+                util.remove_object(socket)
+
+
 def cut_horizontal(parts, coll, hz):
-    """Horizontal Split: cut every piece into a Top and Bottom stack at height
-    ``hz`` (each prints shorter — the XL-mold workflow). The bolted flange ring
-    welded on before the vertical split provides the mating lip on both sides of
-    the seam. A piece lying entirely on one side is kept as-is."""
+    """Back-compat: single horizontal seam (Top/Bottom stack)."""
+    return cut_stack(parts, coll, [hz])
+
+
+def cut_stack(parts, coll, seam_zs):
+    """Cut every piece at each seam height into stacked LEVELS, each printing
+    shorter (the XL-mold / Printer Fit workflow). The bolted flange rings welded
+    on before the vertical split provide the mating lip on both sides of every
+    seam. Seams outside a piece's z-range are skipped for that piece; a piece
+    with no seam inside it is kept as-is.
+
+    Naming: one seam keeps the classic ``_Bot``/``_Top``; more levels are
+    numbered ``_S1`` (bottom) up to ``_Sn`` (top), so files sort in stack order."""
+    zs = sorted(seam_zs)
     out = []
     for part in parts:
         mn, mx = util.world_bbox(part)
-        if hz <= mn.z + 0.2 or hz >= mx.z - 0.2:
+        cuts = [z for z in zs if mn.z + 0.2 < z < mx.z - 0.2]
+        if not cuts:
             out.append(part)
             continue
+        base = part.name
         size = mx - mn
         big = max(size.x, size.y, size.z) * 2.0 + 10.0
         cen = (mn + mx) * 0.5
-        top = util.duplicate_object(part, part.name + "_Top", coll)
-        below = util.add_box("MF_hcut", Vector((cen.x, cen.y, hz - big * 0.5)),
-                             Vector((big, big, big)), coll)
-        util.boolean(top, below, 'DIFFERENCE')
-        util.remove_object(below)
-        above = util.add_box("MF_hcut", Vector((cen.x, cen.y, hz + big * 0.5)),
-                             Vector((big, big, big)), coll)
-        util.boolean(part, above, 'DIFFERENCE')
-        util.remove_object(above)
-        part.name = part.name + "_Bot"
-        util.remove_small_islands(part)
-        util.remove_small_islands(top)
-        out.extend([part, top])
+        bounds = [mn.z - 5.0] + cuts + [mx.z + 5.0]
+        levels = []
+        for i in range(len(bounds) - 1):
+            z0, z1 = bounds[i], bounds[i + 1]
+            seg = util.duplicate_object(part, "MF_seg", coll)
+            slab = util.add_box("MF_hcut",
+                                Vector((cen.x, cen.y, (z0 + z1) * 0.5)),
+                                Vector((big, big, z1 - z0)), coll)
+            util.boolean(seg, slab, 'INTERSECT')
+            util.remove_object(slab)
+            util.remove_small_islands(seg)
+            levels.append(seg)
+        util.remove_object(part)
+        if len(levels) == 2:
+            levels[0].name, levels[1].name = base + "_Bot", base + "_Top"
+        else:
+            for i, seg in enumerate(levels):
+                seg.name = f"{base}_S{i + 1}"
+        out.extend(levels)
     return out
 
 

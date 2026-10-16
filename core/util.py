@@ -11,6 +11,30 @@ from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 
 COLLECTION_NAME = "MoldForge"
+MARKER_COLLECTION = "MoldForge Markers"
+
+
+def marker_points(prefix):
+    """World positions of the user's marker empties (``MF_VentMark`` /
+    ``MF_PourMark``) in the markers collection. Markers are ordinary objects the
+    user moves/duplicates/deletes; they live OUTSIDE the output collection so
+    regeneration never wipes them."""
+    coll = bpy.data.collections.get(MARKER_COLLECTION)
+    if coll is None:
+        return []
+    out = []
+    for o in coll.objects:
+        if not o.name.startswith(prefix):
+            continue
+        # matrix_basis, not matrix_world: the world matrix lags until a depsgraph
+        # pass (and never updates if the collection isn't in the view layer) —
+        # the basis always reflects the location the user set.
+        if o.parent is None:
+            out.append(o.matrix_basis.translation.copy())
+        else:
+            out.append((o.parent.matrix_world @ o.matrix_parent_inverse
+                        @ o.matrix_basis).translation.copy())
+    return out
 
 
 def ensure_collection(name=COLLECTION_NAME):
@@ -145,6 +169,47 @@ def _face_components(bm):
     return comps
 
 
+def fill_voids(obj):
+    """Delete the inner walls of hollows sealed inside a solid - the face
+    islands that enclose negative volume (their normals face into the hollow)
+    - so the hollow is filled. A cavity cutter with such a hollow carves a
+    mold around it and leaves the plastic inside floating in the silicone
+    space (a model with a hollow underside on a Locking Base: the pocket
+    between the plinth's top and the underside). Returns the number filled."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        comps = _face_components(bm)
+        if len(comps) <= 1:
+            return 0
+        mw = obj.matrix_world
+        voids = []
+        for comp in comps:
+            sv = 0.0
+            for f in comp:
+                co = [mw @ lp.vert.co for lp in f.loops]
+                for i in range(1, len(co) - 1):
+                    sv += co[0].dot(co[i].cross(co[i + 1])) / 6.0
+            if sv < 0.0:
+                voids.append(comp)
+        if not voids or len(voids) == len(comps):
+            return 0                        # nothing sealed in, or inside out
+        faces = [f for comp in voids for f in comp]
+        verts = {v for f in faces for v in f.verts}
+        bmesh.ops.delete(bm, geom=faces, context='FACES_ONLY')
+        loose_e = [e for e in bm.edges if not e.link_faces]
+        if loose_e:
+            bmesh.ops.delete(bm, geom=loose_e, context='EDGES')
+        loose_v = [v for v in verts if v.is_valid and not v.link_edges]
+        if loose_v:
+            bmesh.ops.delete(bm, geom=loose_v, context='VERTS')
+        bm.to_mesh(obj.data)
+        obj.data.update()
+        return len(voids)
+    finally:
+        bm.free()
+
+
 def remove_small_islands(obj, face_frac=0.04, size_frac=0.15):
     """Delete tiny disconnected face-islands — the few-face slivers a Solidify or
     boolean throws off a concave surface — that are BOTH low-poly (< ``face_frac`` of
@@ -237,6 +302,74 @@ def largest_island_fraction(obj):
         bm.free()
 
 
+def flip_normals(obj):
+    """Reverse every face so an inside-out solid reads as positive volume."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bmesh.ops.reverse_faces(bm, faces=bm.faces[:])
+    bm.to_mesh(obj.data)
+    bm.free()
+    obj.data.update()
+
+
+def split_islands(obj, coll, min_vol_frac=0.02, min_diag=8.0):
+    """Separate a part that came out in several pieces. Pieces that are real
+    (at least ``min_vol_frac`` of the largest piece's volume and ``min_diag``
+    across) become parts of their own - the largest stays in ``obj``, the others
+    are new objects named ``obj.name + "2"``, ``"3"``... - and slivers are
+    dropped. Returns ``(pieces, dropped)``: the list of part objects (``obj``
+    first) and how many slivers were removed."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    comps = _face_components(bm)
+    if len(comps) <= 1:
+        bm.free()
+        return [obj], 0
+
+    def stats(c):
+        vs = {v for f in c for v in f.verts}
+        xs = [v.co.x for v in vs]; ys = [v.co.y for v in vs]; zs = [v.co.z for v in vs]
+        diag = math.sqrt((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2
+                         + (max(zs) - min(zs)) ** 2)
+        vol = 0.0
+        for f in c:
+            vv = [lp.vert.co for lp in f.loops]
+            for k in range(1, len(vv) - 1):
+                vol += vv[0].dot(vv[k].cross(vv[k + 1])) / 6.0
+        return abs(vol), diag
+
+    info = sorted(((stats(c), i) for i, c in enumerate(comps)),
+                  key=lambda t: -t[0][0])
+    big_vol = info[0][0][0] or 1e-9
+    keep, drop = [], []
+    for (vol, diag), i in info:
+        if i == info[0][1] or (vol >= min_vol_frac * big_vol and diag >= min_diag):
+            keep.append(i)
+        else:
+            drop.append(i)
+    bm.free()
+    pieces = [obj]
+    src = obj.data.copy()
+    for rank, i in enumerate(keep):
+        bmk = bmesh.new()
+        bmk.from_mesh(src)
+        comps_k = _face_components(bmk)
+        # the component order is deterministic for the same mesh
+        doomed = [f for j, c in enumerate(comps_k) if j != i for f in c]
+        bmesh.ops.delete(bmk, geom=doomed, context='FACES')
+        if rank == 0:
+            bmk.to_mesh(obj.data)
+            obj.data.update()
+        else:
+            piece = new_mesh_object(f"{obj.name}{rank + 1}", bmk, coll)
+            piece.matrix_world = obj.matrix_world.copy()
+            pieces.append(piece)
+            continue
+        bmk.free()
+    bpy.data.meshes.remove(src)
+    return pieces, len(drop)
+
+
 def keep_largest_island(obj):
     """Delete every face-island except the biggest, and return the fraction (by
     face count) that was discarded. A last-resort cleanup for a half left with a
@@ -257,6 +390,160 @@ def keep_largest_island(obj):
         return discarded / total
     finally:
         bm.free()
+
+
+def folded_faces(obj):
+    """Indices of polygons whose own triangulation folds back on itself: at least
+    one of Blender's triangles for the face points against the face's normal.
+    The fast boolean solver leaves such faces where it merges coplanar pieces
+    into one polygon with a zero-width slit (a leg top split in two by a wall
+    standing on it, a hook face split by a pin channel). The mesh is still
+    closed, but those triangles render black and export as inverted facets."""
+    me = obj.data
+    me.calc_loop_triangles()
+    bad = set()
+    for lt in me.loop_triangles:
+        if lt.area > 1e-5 and lt.normal.dot(me.polygons[lt.polygon_index].normal) < 0.0:
+            bad.add(lt.polygon_index)
+    return sorted(bad)
+
+
+def _zigzag_edges(bm, face):
+    """Edges whose collapse untangles ``face``: where the outline's edges i and
+    i+2 cross, the middle edge i+1 runs backwards (a zig-zag knot a fraction of
+    a millimetre across, left by a boolean). Planar faces only."""
+    import mathutils.geometry as mg
+    loops = list(face.loops)
+    m = len(loops)
+    if m < 5:
+        return []
+    n = face.normal
+    u = n.orthogonal().normalized()
+    v = n.cross(u)
+    p2 = [Vector((lp.vert.co.dot(u), lp.vert.co.dot(v))) for lp in loops]
+    out = []
+    for i in range(m):
+        a1, a2 = p2[i], p2[(i + 1) % m]
+        b1, b2 = p2[(i + 2) % m], p2[(i + 3) % m]
+        if mg.intersect_line_line_2d(a1, a2, b1, b2) is not None:
+            out.append(loops[(i + 1) % m].edge)
+    return out
+
+
+def fix_folded_faces(obj, dist=1e-4):
+    """Repair ``folded_faces``, in two stages, each kept only if it leaves the
+    mesh a valid solid with fewer folds (else the mesh is restored):
+
+    1. Zero-area polygons that run out and back along the same line (a slit or
+       spike left where the boolean merged coplanar pieces): dissolving
+       degenerate geometry within ``dist`` welds them shut.
+    2. Large flat faces whose outline crosses itself in a tiny zig-zag (edges i
+       and i+2 crossing, the middle edge running backwards): Blender's
+       triangulation of the WHOLE face then folds, a black patch of tens of
+       square millimetres from a knot a tenth of a millimetre wide. Collapsing
+       the backwards edge unties it.
+
+    3. Whatever is left: those faces are split into triangles (the shape is
+       unchanged) and each triangle that still faces backwards - a sliver
+       whose shortest edge is under 0.3 mm, left where a contoured seam meets
+       a wing or the socket - is collapsed onto that edge. A backwards needle
+       thinner than 0.02 mm is left as it is: it has no area to show.
+
+    Returns the folded faces left."""
+    bad = folded_faces(obj)
+    if not bad:
+        return 0
+    for stage in (1, 2, 3):
+        bak = obj.data.copy()
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        try:
+            if stage == 1:
+                bmesh.ops.dissolve_degenerate(bm, dist=dist, edges=bm.edges[:])
+            elif stage == 3:
+                bm.faces.ensure_lookup_table()
+                bm.normal_update()
+                faces = [bm.faces[fi] for fi in bad if fi < len(bm.faces)]
+                normal = {f: f.normal.copy() for f in faces}
+                out = bmesh.ops.triangulate(bm, faces=faces, quad_method='BEAUTY',
+                                            ngon_method='BEAUTY')
+                fmap = out.get("face_map", {})
+                bm.normal_update()
+                tris = [(t, normal.get(fmap.get(t, t))) for t in out["faces"]]
+
+                def backwards():
+                    # a needle thinner than 0.02 mm is degenerate, not a fold:
+                    # nothing to see and nothing for a slicer to flip
+                    out_ = []
+                    for t, n0 in tris:
+                        if not t.is_valid or n0 is None or t.normal.dot(n0) >= 0.0:
+                            continue
+                        longest = max(e.calc_length() for e in t.edges)
+                        if 2.0 * t.calc_area() / max(longest, 1e-9) >= 0.02:
+                            out_.append(t)
+                    return out_
+                # (none at all: only Blender's fill of the whole face folded)
+                edges = []
+                for t in backwards():
+                    e = min(t.edges, key=lambda e_: e_.calc_length())
+                    if e.calc_length() >= 0.3:
+                        edges = None          # a real fold, not a sliver: leave it
+                        break
+                    edges.append(e)
+                if edges is None:
+                    bpy.data.meshes.remove(bak)
+                    continue
+                if edges:
+                    edges = list({e.index: e for e in edges if e.is_valid}.values())
+                    bmesh.ops.collapse(bm, edges=edges, uvs=False)
+                    bm.normal_update()
+                    if backwards():
+                        bpy.data.meshes.remove(bak)
+                        continue
+                    loose = [e for e in bm.edges if e.is_wire]
+                    if loose:
+                        bmesh.ops.delete(bm, geom=loose, context='EDGES')
+                    lv = [v for v in bm.verts if not v.link_edges]
+                    if lv:
+                        bmesh.ops.delete(bm, geom=lv, context='VERTS')
+                # (no dissolve here: welding the needle triangles opens the
+                # mesh where they sit between two real faces)
+            else:
+                bm.faces.ensure_lookup_table()
+                bm.normal_update()
+                edges = []
+                for fi in bad:
+                    if fi < len(bm.faces):
+                        edges += _zigzag_edges(bm, bm.faces[fi])
+                edges = list({e.index: e for e in edges if e.is_valid}.values())
+                if not edges:
+                    bpy.data.meshes.remove(bak)
+                    continue
+                bmesh.ops.collapse(bm, edges=edges, uvs=False)
+                bmesh.ops.dissolve_degenerate(bm, dist=dist, edges=bm.edges[:])
+                loose = [e for e in bm.edges if e.is_wire]
+                if loose:                     # a collapse can leave a stray edge
+                    bmesh.ops.delete(bm, geom=loose, context='EDGES')
+                lv = [v for v in bm.verts if not v.link_edges]
+                if lv:
+                    bmesh.ops.delete(bm, geom=lv, context='VERTS')
+            bm.to_mesh(obj.data)
+            obj.data.update()
+        finally:
+            bm.free()
+        left = folded_faces(obj)
+        if len(left) < len(bad) and part_is_valid(obj)[0]:
+            if bak.users == 0:
+                bpy.data.meshes.remove(bak)
+            bad = left
+            if not bad:
+                return 0
+            continue
+        cur = obj.data
+        obj.data = bak
+        if cur.users == 0:
+            bpy.data.meshes.remove(cur)
+    return len(bad)
 
 
 def part_is_valid(obj):
@@ -364,6 +651,22 @@ def remove_object(obj):
         bpy.data.meshes.remove(me)
 
 
+def join_meshes(target, src):
+    """Append ``src``'s geometry into ``target`` (brought into ``target``'s local space)
+    and remove ``src``. A plain mesh merge — no boolean — so it never fails and keeps
+    full detail; overlapping closed solids print and nest fine."""
+    bm = bmesh.new()
+    bm.from_mesh(target.data)
+    tmp = src.data.copy()
+    tmp.transform(target.matrix_world.inverted() @ src.matrix_world)
+    bm.from_mesh(tmp)
+    bpy.data.meshes.remove(tmp)
+    bm.to_mesh(target.data)
+    bm.free()
+    target.data.update()
+    remove_object(src)
+
+
 def apply_all_modifiers(obj):
     """Bake the evaluated mesh back onto the object (applies every modifier)."""
     deps = bpy.context.evaluated_depsgraph_get()
@@ -435,6 +738,73 @@ def _axis_rotation(axis):
     return Matrix.Identity(4)
 
 
+def shave_thin_blades(obj, max_thick=0.4, min_span=3.0):
+    """Remove paper-thin boolean shards: a vent bore that grazes a seam plane
+    or a sloped outer wall leaves a sub-millimetre blade standing on the shell
+    (a fragile needle right where a Locking Base opens at the bottom). Finds
+    connected clusters of long-skinny faces that are (a) thinner than
+    ``max_thick`` across their world bbox, (b) longer than ``min_span`` and
+    (c) genuinely two-sided (opposed normals - a flat triangulated wall face
+    is skinny too but must never be cut), then shaves each off with a small
+    padded box DIFFERENCE. Returns how many blades were removed."""
+    mw = obj.matrix_world
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    skinny = set()
+    for f in bm.faces:
+        a = f.calc_area()
+        if a <= 1e-9:
+            continue
+        e = max(ed.calc_length() for ed in f.edges)
+        if e > 1.2 and e * e / a > 60.0:
+            skinny.add(f.index)
+    boxes = []
+    seen = set()
+    for fi in skinny:
+        if fi in seen:
+            continue
+        stack, comp = [fi], []
+        while stack:
+            k = stack.pop()
+            if k in seen:
+                continue
+            seen.add(k)
+            comp.append(k)
+            for ed in bm.faces[k].edges:
+                for lf in ed.link_faces:
+                    if lf.index in skinny and lf.index not in seen:
+                        stack.append(lf.index)
+        if len(comp) < 3:
+            continue
+        pts = [mw @ v.co for k in comp for v in bm.faces[k].verts]
+        dims = sorted((max(q.x for q in pts) - min(q.x for q in pts),
+                       max(q.y for q in pts) - min(q.y for q in pts),
+                       max(q.z for q in pts) - min(q.z for q in pts)))
+        if dims[0] >= max_thick or dims[2] <= min_span:
+            continue
+        normals = [bm.faces[k].normal.copy() for k in comp[:200]]
+        opposed = any(normals[i].dot(normals[j]) < -0.6
+                      for i in range(len(normals))
+                      for j in range(i + 1, len(normals)))
+        if not opposed:
+            continue
+        lo = Vector((min(q.x for q in pts), min(q.y for q in pts),
+                     min(q.z for q in pts)))
+        hi = Vector((max(q.x for q in pts), max(q.y for q in pts),
+                     max(q.z for q in pts)))
+        boxes.append((lo, hi))
+    bm.free()
+    for lo, hi in boxes[:8]:
+        cutter = add_box("MF_shave", (lo + hi) * 0.5,
+                         Vector((hi.x - lo.x + 0.7, hi.y - lo.y + 0.7,
+                                 hi.z - lo.z + 0.7)),
+                         obj.users_collection[0] if obj.users_collection else None)
+        boolean(obj, cutter, 'DIFFERENCE')
+        remove_object(cutter)
+    return min(len(boxes), 8)
+
+
 def add_box(name, center, size, coll, rot_z=0.0):
     """Box of dimensions ``size`` (Vector) centered at ``center``, optionally
     rotated ``rot_z`` radians about its own vertical axis (for radial seams)."""
@@ -443,6 +813,19 @@ def add_box(name, center, size, coll, rot_z=0.0):
         Vector((size.x, size.y, size.z, 1.0))
     )
     bmesh.ops.create_cube(bm, size=1.0, matrix=mat)
+    return new_mesh_object(name, bm, coll)
+
+
+def add_tube(name, a, b, r, coll, segs=32):
+    """Solid round bar of radius ``r`` between world points ``a`` and ``b``
+    (external runner tubes/stubs)."""
+    d = Vector(b) - Vector(a)
+    length = max(d.length, 1e-4)
+    mat = (Matrix.Translation((Vector(a) + Vector(b)) * 0.5)
+           @ d.to_track_quat('Z', 'Y').to_matrix().to_4x4())
+    bm = bmesh.new()
+    bmesh.ops.create_cone(bm, cap_ends=True, segments=segs, radius1=r, radius2=r,
+                          depth=length, matrix=mat)
     return new_mesh_object(name, bm, coll)
 
 

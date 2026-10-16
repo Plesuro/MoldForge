@@ -2,10 +2,10 @@ schema_version = "1.0.0"
 
 id = "moldforge"
 name = "MoldForge"
-version = "0.23.2"
+version = "0.44.2"
 
 tagline = "Generate printable silicone mold systems from a mesh"
-description = "Turns a 3D model into a printable mold: a silicone pour box (with optional glove-mold skin keys), a direct printed mold (hugging or block), or a one-part open tray for flat & relief objects like text, coins and medallions (embed for a silicone stamp or frame a real object, with a rectangular or material-saving hugging outline). The box/direct molds split vertically into 2-4 pieces and optionally horizontally with a bolted insert-ready flange ring. Auto-orients and contours the split with keys/teeth, adds clamp wings, shapeable pour funnels (straight tube to wide flare), air vents and a detachable keyed base plate, warns about undercuts, estimates volume & weight, and exports STL."
+description = "Turns a 3D model into a printable mold: a silicone pour box (with optional glove-mold skin keys), a direct printed mold (hugging or block), or a one-part open tray for flat & relief objects like text, coins and medallions (embed for a silicone stamp or frame a real object, with a rectangular or material-saving hugging outline), including a Stamp maker that engraves an SVG file or a Blender Text/Curve design into a pour-ready pan for real silicone ink stamps. The box/direct molds split vertically into 2-4 pieces and optionally horizontally with a bolted insert-ready flange ring; Printer Fit cuts shells taller than your printer's build height into bolted stacked levels automatically, and a too-tall positive into glue-up sections that self-align with printed pegs. Auto-orients and contours the split with keys/teeth, adds clamp wings, an exploded assembly preview, a dual-density firm-core/soft-shell casting kit riding a socket cross, a Vac-U-Lock-style anchor-plug former, shapeable pour funnels (straight tube to wide flare), air vents (auto or dropped exactly at your markers) and a detachable keyed base plate the master can be screwed to, saves your settings as named presets, a bottom-fill pour channel, framed weight labels that follow the shell's curve, stand legs to cast in the pour box turned over, warns about undercuts, estimates volume & weight, and exports STL. Includes a Locking Base option that unites a sawtooth plinth into the high-poly positive so the printed shells socket onto it with a tolerance fit and lock in place, printing open at the bottom."
 website = "https://moldforge.plesuro.eu"
 
 maintainer = "Plesuro <moldforge@plesuro.eu>"
@@ -19,7 +19,7 @@ blender_version_min = "5.1.0"
 tags = ["Mesh", "Modeling", "Object"]
 
 [permissions]
-files = "Export the generated mold parts as STL files"
+files = "Export mold parts as STL files and keep your saved settings"
 
 [build]
 paths_exclude_pattern = [
@@ -28,4 +28,7 @@ paths_exclude_pattern = [
   "tests/",
   "site/",
   "/.gitignore",
+  "/*.stl",
+  "/*.obj",
+  "/*.fbx",
 ]
